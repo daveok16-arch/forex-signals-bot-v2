@@ -1,13 +1,38 @@
-# Kaggle Notebook Setup Guide
+# Kaggle Notebook Setup Guide v2.2
 
 ## How To Create The 4 Kaggle Notebooks
 
-You have 4 Python files in `kaggle/agents/` and `kaggle/meta/`. 
+You have 4 Python files in `kaggle/agents/` and `kaggle/meta/`.
 You must create **4 separate Kaggle notebooks** and paste the code into each.
 
 ---
 
-## Step 1: Create the ETL Notebook (already done in Step 1)
+## Dataset Path Discovery (New in v2.2)
+
+All notebooks now include an **inline robust data loader** that automatically discovers the dataset across all known Kaggle mount paths:
+
+```
+/kaggle/input/datasets/chamberbot/forex-raw-data/     ← "Add Data" via search
+/kaggle/input/forex-raw-data/                          ← Legacy mount
+/kaggle/input/chamberbot-forex-raw-data/               ← Owner-prefixed variant
+./forex_features.parquet                                ← Local/GitHub Actions
+/kaggle/working/forex_etl_output/                       ← ETL output fallback
+```
+
+If the dataset is mounted in an unexpected location, the loader **recursively scans `/kaggle/input/`** and finds it automatically. You will see debug output like:
+
+```
+[data_loader v2.2] Dataset discovery:
+    FOUND: /kaggle/input/datasets/chamberbot/forex-raw-data/forex_features.parquet
+    missing: /kaggle/input/forex-raw-data/forex_features.parquet
+[data_loader] Loading from: /kaggle/input/datasets/chamberbot/forex-raw-data/forex_features.parquet
+[data_loader] Shape: (45000, 18) | Pairs: 8 | TFs: 4
+[data_loader] Validation passed: 45000 rows
+```
+
+---
+
+## Step 1: ETL Notebook (already done)
 - File: `kaggle/etl/daily_etl.py`
 - Name on Kaggle: `forex-daily-etl`
 - Schedule: Daily at 00:00 UTC
@@ -15,77 +40,55 @@ You must create **4 separate Kaggle notebooks** and paste the code into each.
 
 ---
 
-## Step 2: Create Agent A — LSTM Price Action
+## Step 2: Agent A — LSTM Price Action
 
 1. Go to https://www.kaggle.com/code → **New Notebook**
 2. **Settings** (right panel):
    - **Accelerator**: GPU (T4 x2 or P100)
    - **Internet**: ON
 3. **Add Data** (right panel):
-   - Search for your dataset: `chamberbot/forex-raw-data`
+   - Search: `chamberbot/forex-raw-data`
    - Click **Add**
-4. In the notebook, create a **Code cell** and paste the **entire contents** of:
-   `kaggle/agents/lstm_price_action.py`
+4. Paste entire contents of `kaggle/agents/lstm_price_action.py`
 5. **File → Save Version** → Save & Run
-6. Wait for training to complete (5-15 minutes)
-7. Check **Output** tab — you should see:
-   - `price_action_lstm.onnx`
-   - `price_action_lstm_meta.json`
-8. **Important**: Go to notebook settings and **turn ON "Keep data source in sync"**
+6. Check **Output** tab for `price_action_lstm.onnx`
 
 ---
 
-## Step 3: Create Agent B — XGBoost Macro-Sentiment
+## Step 3: Agent B — XGBoost Macro-Sentiment
 
 1. New Notebook
-2. **Settings**:
-   - **Accelerator**: None (CPU is fine)
-   - **Internet**: ON
+2. **Settings**: Accelerator = None (CPU), Internet = ON
 3. **Add Data**: `chamberbot/forex-raw-data`
-4. Paste entire contents of: `kaggle/agents/xgb_macro_sentiment.py`
+4. Paste `kaggle/agents/xgb_macro_sentiment.py`
 5. Save & Run
-6. Expected output:
-   - `macro_sentiment_xgb.onnx`
-   - `macro_sentiment_xgb_meta.json`
+6. Expected output: `macro_sentiment_xgb.onnx`
 
 ---
 
-## Step 4: Create Agent C — RF Volatility Regime
+## Step 4: Agent C — RF Volatility Regime
 
 1. New Notebook
-2. **Settings**:
-   - **Accelerator**: None (CPU)
-   - **Internet**: ON
+2. **Settings**: Accelerator = None (CPU), Internet = ON
 3. **Add Data**: `chamberbot/forex-raw-data`
-4. Paste entire contents of: `kaggle/agents/rf_volatility_regime.py`
+4. Paste `kaggle/agents/rf_volatility_regime.py`
 5. Save & Run
-6. Expected output:
-   - `volatility_regime_rf.onnx`
-   - `volatility_regime_rf_meta.json`
+6. Expected output: `volatility_regime_rf.onnx`
 
 ---
 
-## Step 5: Create Meta-Ensemble
+## Step 5: Meta-Ensemble
 
 1. New Notebook
-2. **Settings**:
-   - **Accelerator**: None (CPU)
-   - **Internet**: ON
+2. **Settings**: Accelerator = None (CPU), Internet = ON
 3. **Add Data**: `chamberbot/forex-raw-data`
-4. Paste entire contents of: `kaggle/meta/ensemble.py`
+4. Paste `kaggle/meta/ensemble.py`
 5. Save & Run
-6. Expected output:
-   - `meta_ensemble.onnx`
-   - `meta_ensemble_meta.json`
-
-**Note**: The meta-ensemble uses simulated data on first run. For production accuracy,
-save validation outputs from Agents A/B/C as `agent_outputs.csv` and re-run.
+6. Expected output: `meta_ensemble.onnx`
 
 ---
 
 ## Notebook Naming Convention
-
-Name your notebooks **exactly** as follows so GitHub Actions can fetch them:
 
 | Notebook File | Kaggle Notebook Name |
 |---------------|---------------------|
@@ -97,27 +100,16 @@ Name your notebooks **exactly** as follows so GitHub Actions can fetch them:
 
 ---
 
-## After All Notebooks Are Created
-
-1. Update `config/kaggle_notebooks.json` in your GitHub repo with the real notebook IDs
-2. Run the GitHub Action manually to test model fetching:
-   - Go to GitHub repo → Actions → Nightly ETL → Run workflow
-3. Check that models appear in GitHub Release artifacts
-
----
-
 ## Troubleshooting
 
-**"Module not found" errors**: Kaggle notebooks have most packages preinstalled. If missing:
+**"Dataset not found" even with Add Data:**
+The v2.2 loader will scan `/kaggle/input/` recursively. Check the debug output — it lists every path checked and the actual contents of `/kaggle/input/`. If the dataset is mounted under a different name, copy that path and add it to the `POSSIBLE_PATHS` list in the notebook.
+
+**"Module not found" errors:**
 ```python
 !pip install package_name -q
 ```
 
-**"Dataset not found"**: Make sure you clicked **Add Data** and the dataset path is:
-```python
-/kaggle/input/forex-raw-data/forex_features.parquet
-```
+**GPU out of memory:** Reduce `BATCH_SIZE` or `SEQ_LEN` in LSTM agent.
 
-**GPU out of memory**: Reduce `BATCH_SIZE` or `SEQ_LEN` in LSTM agent.
-
-**ONNX export fails**: Ensure you are using `opset_version=14` and the model is on CPU before export.
+**ONNX export fails:** Ensure `opset_version=14` and model is on CPU before export.
