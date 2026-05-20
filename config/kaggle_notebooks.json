@@ -1,0 +1,59 @@
+{
+  "project": "forex-signals-bot",
+  "version": "1.2.0",
+  "owner": "chamberbot",
+  "notebooks": {
+    "etl": {
+      "name": "forex-daily-etl",
+      "id": "PLACEHOLDER_AFTER_CREATION",
+      "type": "data",
+      "schedule": "0 0 * * *",
+      "output_dataset": "chamberbot/forex-raw-data",
+      "gpu": false
+    },
+    "agents": {
+      "price_action_lstm": {
+        "name": "forex-lstm-price-action",
+        "id": "PLACEHOLDER",
+        "type": "model",
+        "gpu": true,
+        "input_dataset": "chamberbot/forex-raw-data",
+        "output_model": "price_action_lstm.onnx",
+        "timeframe": "1h",
+        "lookback_bars": 48
+      },
+      "macro_sentiment_xgb": {
+        "name": "forex-xgb-macro-sentiment",
+        "id": "PLACEHOLDER",
+        "type": "model",
+        "gpu": false,
+        "input_dataset": "chamberbot/forex-raw-data",
+        "output_model": "macro_sentiment_xgb.onnx",
+        "timeframe": "1d",
+        "lookback_bars": 20
+      },
+      "volatility_regime_rf": {
+        "name": "forex-rf-volatility-regime",
+        "id": "PLACEHOLDER",
+        "type": "model",
+        "gpu": false,
+        "input_dataset": "chamberbot/forex-raw-data",
+        "output_model": "volatility_regime_rf.onnx",
+        "timeframe": "1h",
+        "lookback_bars": 24
+      }
+    },
+    "meta": {
+      "name": "forex-meta-ensemble",
+      "id": "PLACEHOLDER",
+      "type": "ensemble",
+      "gpu": false,
+      "input_models": [
+        "price_action_lstm.onnx",
+        "macro_sentiment_xgb.onnx",
+        "volatility_regime_rf.onnx"
+      ],
+      "output_model": "meta_ensemble.onnx"
+    }
+  }
+}

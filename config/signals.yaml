@@ -1,0 +1,86 @@
+# Forex AI/ML Signals Bot - Master Configuration
+# DO NOT EDIT MANUALLY ON KAGGLE. Edit in GitHub repo only.
+
+market:
+  domain: forex
+  session_lookback_days: 180
+  primary_timeframe: 1h
+  entry_timeframe: 15m
+  secondary_timeframes: [15m, 1h, 4h, 1d]
+
+pairs:
+  major:
+    - symbol: EURUSD=X
+      alias: EURUSD
+      spread_threshold: 0.00015
+      volatility_regime: low
+    - symbol: GBPUSD=X
+      alias: GBPUSD
+      spread_threshold: 0.00020
+      volatility_regime: medium
+    - symbol: USDJPY=X
+      alias: USDJPY
+      spread_threshold: 0.015
+      volatility_regime: medium
+    - symbol: AUDUSD=X
+      alias: AUDUSD
+      spread_threshold: 0.00018
+      volatility_regime: high
+    - symbol: USDCAD=X
+      alias: USDCAD
+      spread_threshold: 0.00018
+      volatility_regime: low
+    - symbol: USDCHF=X
+      alias: USDCHF
+      spread_threshold: 0.00016
+      volatility_regime: low
+    - symbol: GC=F
+      alias: XAUUSD
+      spread_threshold: 0.25
+      volatility_regime: high
+      asset_class: commodity
+    - symbol: BTC-USD
+      alias: BTCUSD
+      spread_threshold: 15.00
+      volatility_regime: extreme
+      asset_class: crypto
+
+signal:
+  generation_schedule: "0 */4 * * *"  # Every 4 hours
+  confidence_threshold: 0.65
+  minimum_evidence: 2                   # At least 2 agents must agree
+
+  directions:
+    - LONG
+    - SHORT
+    - NEUTRAL
+
+  risk:
+    max_daily_signals_per_pair: 3
+    cooldown_minutes: 240
+
+agents:
+  enabled:
+    - price_action_lstm
+    - macro_sentiment_xgb
+    - volatility_regime_rf
+
+  weights:
+    price_action_lstm: 0.40
+    macro_sentiment_xgb: 0.35
+    volatility_regime_rf: 0.25
+
+features:
+  technical:
+    - rsi_14
+    - ema_20_50_cross
+    - bollinger_position
+    - atr_14
+    - macd_hist
+  macro:
+    - dxy_index
+    - vix_proxy
+    - yield_spread_us_de
+  sentiment:
+    - retail_positioning
+    - news_polarity

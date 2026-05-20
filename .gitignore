@@ -1,0 +1,19 @@
+# Models & Data
+models/
+*.onnx
+*.parquet
+*.csv
+logs/
+*.log
+
+# Local configs
+config/signals.local.yaml
+
+# Python
+__pycache__/
+*.pyc
+.env
+venv/
+
+# Termux
+termux/*.session

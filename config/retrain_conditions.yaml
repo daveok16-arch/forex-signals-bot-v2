@@ -1,0 +1,24 @@
+# Auto-Retrain Conditions for Forex Bot
+# If ANY condition is breached, GitHub Actions triggers emergency retrain
+
+drift:
+  max_psi: 0.25                    # Population Stability Index threshold
+  feature_drift_threshold: 0.20    # Per-feature drift
+
+performance:
+  min_win_rate: 0.52               # Minimum 52% win rate over last 100 signals
+  max_drawdown_signals: 15         # Max consecutive losing signals before alert
+  sharpe_floor: 0.8                # Minimum Sharpe-like ratio
+
+staleness:
+  max_model_age_hours: 48          # Models older than 48h trigger retrain
+  max_data_freshness_hours: 6      # Data older than 6h is stale
+
+actions:
+  on_breach:
+    - notify_telegram
+    - trigger_kaggle_retrain
+    - archive_logs
+  fallback:
+    use_previous_model: true
+    reduce_position_size: 0.50       # Halve signal strength during retrain
