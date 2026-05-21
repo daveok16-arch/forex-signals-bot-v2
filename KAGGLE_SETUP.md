@@ -1,4 +1,4 @@
-# Kaggle Notebook Setup Guide v2.2
+# Kaggle Notebook Setup Guide v2.3.2
 
 ## How To Create The 4 Kaggle Notebooks
 
