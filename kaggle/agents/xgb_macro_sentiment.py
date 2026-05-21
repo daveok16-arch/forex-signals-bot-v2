@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-Agent B: XGBoost Macro-Sentiment Model v2.3.1
+Agent B: XGBoost Macro-Sentiment Model v2.3.2
 Trains on daily macro features + pair aggregated stats.
 Output: macro_sentiment_xgb.onnx
 
-PATCH v2.3: Full fault tolerance for missing macro columns.
-PATCH v2.3.1: XGBoost API compatibility (early_stopping via callbacks for 2.x+)
+Design: Clean, stable, zero-dependency on XGBoost advanced APIs.
+No early stopping. No callbacks. Pure model.fit() only.
 """
 
-import subprocess, sys
+import subprocess
+import sys
+
 subprocess.check_call([sys.executable, "-m", "pip", "install", "onnxmltools", "--quiet"])
 
 import os
+import json
 import numpy as np
 import pandas as pd
 import warnings
+
 warnings.filterwarnings("ignore")
 
 import xgboost as xgb
@@ -24,13 +28,7 @@ from onnxmltools.convert import convert_xgboost
 from skl2onnx.common.data_types import FloatTensorType
 
 # ============================================================
-# XGBOOST VERSION DETECTION
-# ============================================================
-XGB_MAJOR = int(xgb.__version__.split(".")[0])
-print(f"[xgb_compat] Detected XGBoost version: {xgb.__version__} (major={XGB_MAJOR})")
-
-# ============================================================
-# INLINED DATA LOADER v2.2
+# DATA LOADER
 # ============================================================
 POSSIBLE_PATHS = [
     "/kaggle/input/datasets/chamberbot/forex-raw-data/forex_features.parquet",
@@ -39,14 +37,18 @@ POSSIBLE_PATHS = [
     "/kaggle/input/forex-raw-data/forex_features.csv",
     "/kaggle/input/chamberbot-forex-raw-data/forex_features.parquet",
     "/kaggle/input/chamberbot-forex-raw-data/forex_features.csv",
-    "./forex_features.parquet", "./forex_features.csv",
-    "../forex_features.parquet", "../forex_features.csv",
+    "./forex_features.parquet",
+    "./forex_features.csv",
+    "../forex_features.parquet",
+    "../forex_features.csv",
     "/kaggle/working/forex_etl_output/forex_features.parquet",
     "/kaggle/working/forex_etl_output/forex_features.csv",
 ]
 
+
 def load_forex_data(verbose=True):
     paths_to_check = list(POSSIBLE_PATHS)
+
     if os.path.exists("/kaggle/input"):
         for root, dirs, files in os.walk("/kaggle/input"):
             for fname in files:
@@ -54,18 +56,22 @@ def load_forex_data(verbose=True):
                     full = os.path.join(root, fname)
                     if full not in paths_to_check:
                         paths_to_check.append(full)
+
     found_path = None
     checked = []
+
     for p in paths_to_check:
         checked.append(p)
         if os.path.exists(p):
             found_path = p
             break
+
     if verbose:
-        print(f"[data_loader v2.2] Dataset discovery:")
+        print("[data_loader] Dataset discovery:")
         for p in checked:
             status = "FOUND" if p == found_path else "missing"
             print(f"    {status}: {p}")
+
     if found_path is None:
         debug = []
         if os.path.exists("/kaggle/input"):
@@ -77,51 +83,60 @@ def load_forex_data(verbose=True):
                     try:
                         for s in os.listdir(sub):
                             debug.append(f"      - {s}")
-                    except:
+                    except Exception:
                         pass
-        raise FileNotFoundError(f"Dataset not found. Checked {len(checked)} paths.\n" + "\n".join(debug))
+        raise FileNotFoundError(
+            f"Dataset not found. Checked {len(checked)} paths.\n" + "\n".join(debug)
+        )
+
     if verbose:
         print(f"[data_loader] Loading from: {found_path}")
+
     if found_path.endswith(".parquet"):
         df = pd.read_parquet(found_path)
     else:
         df = pd.read_csv(found_path)
+
     df.columns = [c.lower() if isinstance(c, str) else c for c in df.columns]
+
     required = ["close", "pair", "timeframe"]
     missing = [r for r in required if r not in df.columns]
     if missing:
         raise ValueError(f"Missing columns: {missing}. Have: {list(df.columns)}")
+
     if verbose:
-        print(f"[data_loader] Shape: {df.shape} | Pairs: {df['pair'].nunique()} | TFs: {df['timeframe'].nunique()}")
+        print(
+            f"[data_loader] Shape: {df.shape} | "
+            f"Pairs: {df['pair'].nunique()} | "
+            f"TFs: {df['timeframe'].nunique()}"
+        )
+
     return df
+
 
 def validate_dataset(df, min_rows=200):
     issues = []
+
     if len(df) < min_rows:
         issues.append(f"Only {len(df)} rows (min: {min_rows})")
+
     if df["pair"].nunique() < 2:
         issues.append(f"Only {df['pair'].nunique()} pairs")
+
     nan_cols = [c for c in df.columns if df[c].isna().all()]
     if nan_cols:
         issues.append(f"All-NaN columns: {nan_cols}")
+
     if issues:
         raise RuntimeError("Validation failed:\n" + "\n".join(f"  - {i}" for i in issues))
+
     print(f"[data_loader] Validation passed: {len(df)} rows")
 
-# ============================================================
-# CONFIG
-# ============================================================
-PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "XAUUSD", "BTCUSD"]
-HORIZON = 4
 
 # ============================================================
-# FEATURE ENGINEERING v2.3 (FAULT TOLERANT)
+# FEATURE ENGINEERING (fault tolerant)
 # ============================================================
 def engineer_macro_features(df):
-    """
-    Build daily macro features with dynamic column detection.
-    Survives missing DXY, VIX, or yield spreads.
-    """
     df = df.copy()
     df["datetime"] = pd.to_datetime(df["datetime"])
     df["date"] = df["datetime"].dt.date
@@ -143,8 +158,8 @@ def engineer_macro_features(df):
     for m in available_macro:
         actual_agg[m] = "last"
 
-    print(f"[macro_engineer] Available macro columns: {available_macro}")
-    print(f"[macro_engineer] Aggregation columns: {list(actual_agg.keys())}")
+    print(f"[macro] Available macro columns: {available_macro}")
+    print(f"[macro] Aggregation columns: {list(actual_agg.keys())}")
 
     daily = []
 
@@ -155,27 +170,30 @@ def engineer_macro_features(df):
         day = pdf.groupby("date").agg(actual_agg).reset_index()
 
         if isinstance(day.columns, pd.MultiIndex):
-            day.columns = ["_".join(col).strip("_") if isinstance(col, tuple) else col for col in day.columns.values]
+            day.columns = [
+                "_".join(col).strip("_") if isinstance(col, tuple) else col
+                for col in day.columns.values
+            ]
 
         rename_map = {}
         for c in day.columns:
-            if c == "close_first" or c == "close_first_":
+            if c in ("close_first", "close_first_"):
                 rename_map[c] = "open"
-            elif c == "close_last" or c == "close_last_":
+            elif c in ("close_last", "close_last_"):
                 rename_map[c] = "close"
-            elif c == "close_min" or c == "close_min_":
+            elif c in ("close_min", "close_min_"):
                 rename_map[c] = "low"
-            elif c == "close_max" or c == "close_max_":
+            elif c in ("close_max", "close_max_"):
                 rename_map[c] = "high"
-            elif c == "atr_14_mean" or c == "atr_14_mean_":
+            elif c in ("atr_14_mean", "atr_14_mean_"):
                 rename_map[c] = "avg_atr"
-            elif c == "rsi_14_mean" or c == "rsi_14_mean_":
+            elif c in ("rsi_14_mean", "rsi_14_mean_"):
                 rename_map[c] = "avg_rsi"
-            elif c in ["dxy_index_last", "dxy_index_last_"]:
+            elif c in ("dxy_index_last", "dxy_index_last_"):
                 rename_map[c] = "dxy"
-            elif c in ["vix_proxy_last", "vix_proxy_last_"]:
+            elif c in ("vix_proxy_last", "vix_proxy_last_"):
                 rename_map[c] = "vix"
-            elif c in ["yield_spread_us_de_last", "yield_spread_us_de_last_"]:
+            elif c in ("yield_spread_us_de_last", "yield_spread_us_de_last_"):
                 rename_map[c] = "yield_spread"
 
         if rename_map:
@@ -193,13 +211,11 @@ def engineer_macro_features(df):
         else:
             day["daily_range"] = 0.0
 
-        macro_cols = ["dxy", "vix", "yield_spread"]
-        for col in macro_cols:
+        for col in ("dxy", "vix", "yield_spread"):
             if col in day.columns:
                 day[col] = day[col].ffill().bfill()
 
-        lag_candidates = ["dxy", "vix", "yield_spread", "avg_rsi"]
-        for col in lag_candidates:
+        for col in ("dxy", "vix", "yield_spread", "avg_rsi"):
             if col in day.columns:
                 day[f"{col}_chg_1d"] = day[col].diff(1)
                 day[f"{col}_chg_3d"] = day[col].diff(3)
@@ -215,14 +231,11 @@ def engineer_macro_features(df):
     daily = daily.dropna()
     return daily
 
+
 # ============================================================
-# TRAINING v2.3.1 (XGBOOST API COMPATIBLE)
+# TRAINING (stable, no early stopping, no callbacks)
 # ============================================================
 def train_xgb(X_train, y_train, X_val, y_val):
-    """
-    Train XGBoost with version-safe early stopping.
-    Compatible with XGBoost 1.x and 2.x+ APIs.
-    """
     model = xgb.XGBRegressor(
         n_estimators=300,
         max_depth=6,
@@ -234,58 +247,63 @@ def train_xgb(X_train, y_train, X_val, y_val):
         random_state=42,
         n_jobs=-1,
         objective="reg:squarederror",
-        eval_metric="rmse"
+        eval_metric="rmse",
     )
 
-    # Version-safe early stopping
-    if XGB_MAJOR >= 2:
-        # XGBoost 2.x+: early_stopping_rounds moved to callbacks
-        print("[xgb_compat] Using XGBoost 2.x callback API for early stopping")
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
-            callbacks=[xgb.callback.EarlyStopping(rounds=20, save_best=True)],
-            verbose=False
-        )
-    else:
-        # XGBoost 1.x: legacy API
-        print("[xgb_compat] Using XGBoost 1.x legacy API for early stopping")
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
-            early_stopping_rounds=20,
-            verbose=False
-        )
+    print("[xgb] Training started...")
+
+    model.fit(
+        X_train,
+        y_train,
+        eval_set=[(X_val, y_val)],
+        verbose=False,
+    )
+
+    print("[xgb] Training complete.")
 
     val_pred = model.predict(X_val)
-    val_acc = accuracy_score((y_val > 0.5).astype(int), (val_pred > 0.5).astype(int))
+
+    val_acc = accuracy_score(
+        (y_val > 0.5).astype(int),
+        (val_pred > 0.5).astype(int),
+    )
+
     val_auc = roc_auc_score(y_val, val_pred)
-    print(f"Val Accuracy: {val_acc:.2%} | AUC: {val_auc:.4f}")
+
+    print(f"[xgb] Validation Accuracy: {val_acc:.2%}")
+    print(f"[xgb] Validation AUC: {val_auc:.4f}")
 
     return model
+
 
 # ============================================================
 # ONNX EXPORT
 # ============================================================
 def export_onnx(model, feature_names, path="/kaggle/working/macro_sentiment_xgb.onnx"):
     initial_type = [("input", FloatTensorType([None, len(feature_names)]))]
-    onnx_model = convert_xgboost(model, initial_types=initial_type, target_opset=14)
+    onnx_model = convert_xgboost(
+        model, initial_types=initial_type, target_opset=14
+    )
+
     with open(path, "wb") as f:
         f.write(onnx_model.SerializeToString())
-    print(f"ONNX exported: {path}")
+
+    print(f"[onnx] Exported: {path}")
+
     import onnxruntime as ort
+
     sess = ort.InferenceSession(path)
     dummy = np.random.randn(1, len(feature_names)).astype(np.float32)
     out = sess.run(None, {"input": dummy})[0]
-    print(f"Verification: shape={out.shape} sample={out[0]:.4f}")
+    print(f"[onnx] Verification: shape={out.shape} sample={out[0]:.4f}")
+
 
 # ============================================================
 # MAIN
 # ============================================================
 def main():
     print("=" * 60)
-    print("AGENT B: XGBOOST MACRO-SENTIMENT v2.3.1")
-    print(f"XGBoost: {xgb.__version__}")
+    print("AGENT B: XGBOOST MACRO-SENTIMENT v2.3.2")
     print("=" * 60)
 
     print("[1/4] Loading ETL data...")
@@ -294,16 +312,26 @@ def main():
     print("[2/4] Validating dataset...")
     validate_dataset(df)
 
-    print("[3/4] Engineering macro features (fault tolerant)...")
+    print("[3/4] Engineering macro features...")
     daily = engineer_macro_features(df)
-    print(f"Daily samples: {len(daily)}")
+    print(f"[macro] Daily samples: {len(daily)}")
 
-    exclude = {"date", "pair", "target", "open", "close", "low", "high", "daily_return", "daily_range"}
+    exclude = {
+        "date",
+        "pair",
+        "target",
+        "open",
+        "close",
+        "low",
+        "high",
+        "daily_return",
+        "daily_range",
+    }
     feature_cols = [c for c in daily.columns if c not in exclude]
-    print(f"Dynamic features: {feature_cols}")
+    print(f"[macro] Dynamic features: {feature_cols}")
 
     if len(feature_cols) < 3:
-        print("[WARN] Very few macro features available. Model may be weak.")
+        print("[WARN] Very few macro features. Model may be weak.")
 
     X = daily[feature_cols].values.astype(np.float32)
     y = daily["target"].values.astype(np.float32)
@@ -312,7 +340,7 @@ def main():
         raise RuntimeError("Insufficient macro data.")
 
     X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=(y>0.5).astype(int)
+        X, y, test_size=0.2, random_state=42, stratify=(y > 0.5).astype(int)
     )
 
     print("[4/4] Training XGBoost...")
@@ -324,15 +352,16 @@ def main():
         "feature_cols": feature_cols,
         "samples": len(X),
         "pos_rate": float(y.mean()),
-        "version": "2.3.1",
-        "xgboost_version": xgb.__version__
+        "version": "2.3.2",
     }
+
     with open("/kaggle/working/macro_sentiment_xgb_meta.json", "w") as f:
         json.dump(meta, f, indent=2)
 
     print("=" * 60)
     print("AGENT B COMPLETE")
     print("=" * 60)
+
 
 if __name__ == "__main__":
     main()
