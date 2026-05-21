@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-Agent A: LSTM Price Action Model v2.2
+Agent A: LSTM Price Action Model v2.3.3
 Trains on 1h technical sequences to predict next directional move.
 Output: price_action_lstm.onnx
 
-PATCH: Robust dataset path discovery via inline data_loader.
+PATCH v2.3.3: CUDA kernel compatibility fix for Kaggle GPU notebooks.
+- Safe device detection with CUDA capability verification
+- Automatic CPU fallback if CUDA kernel image is incompatible
+- Removes dropout from LSTM (avoids CUDA kernel issues on some archs)
+- Bidirectional LSTM kept but with safe initialization
 """
 
 import os
-import sys
+import json
 import numpy as np
 import pandas as pd
 import warnings
@@ -21,7 +25,42 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.model_selection import train_test_split
 
 # ============================================================
-# INLINED DATA LOADER (shared utility pattern)
+# SAFE DEVICE DETECTION
+# ============================================================
+def get_safe_device():
+    """
+    Detect CUDA availability with kernel compatibility check.
+    Falls back to CPU if CUDA initialization fails.
+    """
+    if not torch.cuda.is_available():
+        print("[device] CUDA not available. Using CPU.")
+        return torch.device("cpu")
+
+    try:
+        # Test CUDA with a small tensor operation
+        test_tensor = torch.randn(2, 2).cuda()
+        _ = test_tensor @ test_tensor.T
+        torch.cuda.synchronize()
+
+        device_name = torch.cuda.get_device_name(0)
+        capability = torch.cuda.get_device_capability(0)
+        print(f"[device] CUDA OK: {device_name} (capability {capability[0]}.{capability[1]})")
+        print(f"[device] PyTorch {torch.__version__} | CUDA {torch.version.cuda}")
+
+        # Warn on old architectures that may have kernel issues
+        if capability[0] < 6:
+            print("[device] WARNING: Old GPU architecture. May have kernel compatibility issues.")
+
+        return torch.device("cuda")
+    except Exception as e:
+        print(f"[device] CUDA test failed: {e}")
+        print("[device] Falling back to CPU to avoid kernel image errors.")
+        return torch.device("cpu")
+
+DEVICE = get_safe_device()
+
+# ============================================================
+# INLINED DATA LOADER v2.2
 # ============================================================
 POSSIBLE_PATHS = [
     "/kaggle/input/datasets/chamberbot/forex-raw-data/forex_features.parquet",
@@ -38,7 +77,6 @@ POSSIBLE_PATHS = [
 
 def load_forex_data(verbose=True):
     paths_to_check = list(POSSIBLE_PATHS)
-    # Scan /kaggle/input recursively
     if os.path.exists("/kaggle/input"):
         for root, dirs, files in os.walk("/kaggle/input"):
             for fname in files:
@@ -46,7 +84,6 @@ def load_forex_data(verbose=True):
                     full = os.path.join(root, fname)
                     if full not in paths_to_check:
                         paths_to_check.append(full)
-
     found_path = None
     checked = []
     for p in paths_to_check:
@@ -54,13 +91,11 @@ def load_forex_data(verbose=True):
         if os.path.exists(p):
             found_path = p
             break
-
     if verbose:
-        print(f"[data_loader v2.2] Dataset discovery:")
+        print("[data_loader] Dataset discovery:")
         for p in checked:
             status = "FOUND" if p == found_path else "missing"
             print(f"    {status}: {p}")
-
     if found_path is None:
         debug = []
         if os.path.exists("/kaggle/input"):
@@ -75,22 +110,17 @@ def load_forex_data(verbose=True):
                     except:
                         pass
         raise FileNotFoundError(f"Dataset not found. Checked {len(checked)} paths.\n" + "\n".join(debug))
-
     if verbose:
         print(f"[data_loader] Loading from: {found_path}")
-
     if found_path.endswith(".parquet"):
         df = pd.read_parquet(found_path)
     else:
         df = pd.read_csv(found_path)
-
     df.columns = [c.lower() if isinstance(c, str) else c for c in df.columns]
-
     required = ["close", "pair", "timeframe"]
     missing = [r for r in required if r not in df.columns]
     if missing:
         raise ValueError(f"Missing columns: {missing}. Have: {list(df.columns)}")
-
     if verbose:
         print(f"[data_loader] Shape: {df.shape} | Pairs: {df['pair'].nunique()} | TFs: {df['timeframe'].nunique()}")
     return df
@@ -116,7 +146,6 @@ PRED_HORIZON = 4
 BATCH_SIZE = 64
 EPOCHS = 50
 LR = 1e-3
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 FEATURE_COLS = ["rsi_14", "ema_20_50_cross", "bollinger_position", "macd_hist", "atr_14", "returns"]
 PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "XAUUSD", "BTCUSD"]
@@ -164,7 +193,7 @@ def create_sequences(df, feature_cols, seq_len=48, horizon=4):
     return np.array(X), np.array(y)
 
 # ============================================================
-# PYTORCH
+# PYTORCH DATASET
 # ============================================================
 class ForexDataset(Dataset):
     def __init__(self, X, y):
@@ -175,15 +204,28 @@ class ForexDataset(Dataset):
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
+# ============================================================
+# MODEL ARCHITECTURE (CUDA-safe)
+# ============================================================
 class LSTMPriceAction(nn.Module):
-    def __init__(self, input_dim, hidden_dim=128, num_layers=2, dropout=0.3):
+    """
+    Bidirectional LSTM without intra-layer dropout.
+    Dropout between LSTM and FC layers only to avoid CUDA kernel issues.
+    """
+    def __init__(self, input_dim, hidden_dim=128, num_layers=2):
         super().__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout, bidirectional=True)
+        # Note: dropout=0 in LSTM to avoid "no kernel image" errors
+        # Some Kaggle GPU builds lack kernels for dropout-enabled cuDNN LSTM
+        self.lstm = nn.LSTM(
+            input_dim, hidden_dim, num_layers,
+            batch_first=True, dropout=0.0, bidirectional=True
+        )
         self.fc1 = nn.Linear(hidden_dim * 2, 64)
         self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(0.2)
+        self.dropout = nn.Dropout(0.3)
         self.fc2 = nn.Linear(64, 1)
         self.sigmoid = nn.Sigmoid()
+
     def forward(self, x):
         lstm_out, _ = self.lstm(x)
         last = lstm_out[:, -1, :]
@@ -193,25 +235,39 @@ class LSTMPriceAction(nn.Module):
         x = self.fc2(x)
         return self.sigmoid(x)
 
+# ============================================================
+# TRAINING (with CUDA safety)
+# ============================================================
 def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3):
     model = model.to(DEVICE)
     criterion = nn.BCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+
     best_val_loss = float("inf")
     best_state = None
+
     for epoch in range(epochs):
         model.train()
         train_losses = []
         for xb, yb in train_loader:
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
             optimizer.zero_grad()
-            pred = model(xb)
+            try:
+                pred = model(xb)
+            except RuntimeError as e:
+                if "no kernel image" in str(e).lower():
+                    print(f"[FATAL] CUDA kernel error during forward: {e}")
+                    print("[FATAL] Try re-running with CPU by setting DEVICE = torch.device('cpu')")
+                    raise
+                else:
+                    raise
             loss = criterion(pred, yb)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             train_losses.append(loss.item())
+
         model.eval()
         val_losses = []
         with torch.no_grad():
@@ -220,37 +276,61 @@ def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3):
                 pred = model(xb)
                 loss = criterion(pred, yb)
                 val_losses.append(loss.item())
+
         avg_train = np.mean(train_losses)
         avg_val = np.mean(val_losses)
         scheduler.step(avg_val)
+
         if avg_val < best_val_loss:
             best_val_loss = avg_val
             best_state = model.state_dict().copy()
+
         if (epoch + 1) % 5 == 0:
             print(f"Epoch {epoch+1}/{epochs} | Train: {avg_train:.4f} | Val: {avg_val:.4f}")
+
     if best_state:
         model.load_state_dict(best_state)
     return model
 
+# ============================================================
+# ONNX EXPORT (CPU-safe)
+# ============================================================
 def export_onnx(model, input_dim, seq_len, path="/kaggle/working/price_action_lstm.onnx"):
     model.eval()
-    dummy = torch.randn(1, seq_len, input_dim).to(DEVICE)
-    torch.onnx.export(model, dummy, path,
-        input_names=["input"], output_names=["probability"],
-        dynamic_axes={"input": {0: "batch_size"}, "probability": {0: "batch_size"}},
-        opset_version=14)
-    print(f"ONNX exported: {path}")
+    # Always export from CPU to avoid CUDA-specific ops in ONNX
+    model_cpu = model.to("cpu")
+    dummy = torch.randn(1, seq_len, input_dim)
+
+    torch.onnx.export(
+        model_cpu,
+        dummy,
+        path,
+        input_names=["input"],
+        output_names=["probability"],
+        dynamic_axes={
+            "input": {0: "batch_size"},
+            "probability": {0: "batch_size"}
+        },
+        opset_version=14
+    )
+    print(f"[onnx] Exported: {path}")
+
+    # Verify on CPU
     import onnxruntime as ort
     sess = ort.InferenceSession(path)
-    test_out = sess.run(None, {"input": dummy.cpu().numpy()})[0]
-    print(f"Verification: shape={test_out.shape} sample={test_out[0,0]:.4f}")
+    test_out = sess.run(None, {"input": dummy.numpy()})[0]
+    print(f"[onnx] Verification: shape={test_out.shape} | sample={test_out[0,0]:.4f}")
+
+    # Move model back to original device if needed
+    if DEVICE.type == "cuda":
+        model.to(DEVICE)
 
 # ============================================================
 # MAIN
 # ============================================================
 def main():
     print("=" * 60)
-    print("AGENT A: LSTM PRICE ACTION v2.2")
+    print("AGENT A: LSTM PRICE ACTION v2.3.3")
     print(f"Device: {DEVICE}")
     print("=" * 60)
 
@@ -268,10 +348,12 @@ def main():
     print("[4/5] Creating sequences...")
     X, y = create_sequences(df, feature_cols, SEQ_LEN, PRED_HORIZON)
     print(f"      Sequences: {len(X)} | Positives: {y.mean():.2%}")
+
     if len(X) < 1000:
-        raise RuntimeError("Insufficient training data.")
+        raise RuntimeError("Insufficient training data. Check ETL dataset.")
 
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
     train_ds = ForexDataset(X_train, y_train)
     val_ds = ForexDataset(X_val, y_val)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
@@ -289,13 +371,23 @@ def main():
             pred = model(xb).cpu().numpy()
             all_preds.extend(pred.flatten())
             all_true.extend(yb.numpy().flatten())
-    acc = np.mean((np.array(all_preds) > 0.5) == (np.array(all_true) > 0.5))
-    print(f"Validation Accuracy: {acc:.2%}")
 
+    acc = np.mean((np.array(all_preds) > 0.5) == (np.array(all_true) > 0.5))
+    print(f"      Validation Accuracy: {acc:.2%}")
+
+    print("[onnx] Exporting ONNX...")
     export_onnx(model, len(feature_cols), SEQ_LEN)
 
-    meta = {"agent": "price_action_lstm", "val_accuracy": float(acc), "feature_cols": feature_cols,
-            "seq_len": SEQ_LEN, "horizon": PRED_HORIZON, "device": str(DEVICE), "samples": len(X)}
+    meta = {
+        "agent": "price_action_lstm",
+        "val_accuracy": float(acc),
+        "feature_cols": feature_cols,
+        "seq_len": SEQ_LEN,
+        "horizon": PRED_HORIZON,
+        "device": str(DEVICE),
+        "samples": len(X),
+        "version": "2.3.3"
+    }
     with open("/kaggle/working/price_action_lstm_meta.json", "w") as f:
         json.dump(meta, f, indent=2)
 

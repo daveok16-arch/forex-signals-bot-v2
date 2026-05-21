@@ -7,7 +7,7 @@ You must create **4 separate Kaggle notebooks** and paste the code into each.
 
 ---
 
-## Dataset Path Discovery (New in v2.2)
+## Dataset Path Discovery (v2.2+)
 
 All notebooks now include an **inline robust data loader** that automatically discovers the dataset across all known Kaggle mount paths:
 
@@ -22,7 +22,7 @@ All notebooks now include an **inline robust data loader** that automatically di
 If the dataset is mounted in an unexpected location, the loader **recursively scans `/kaggle/input/`** and finds it automatically. You will see debug output like:
 
 ```
-[data_loader v2.2] Dataset discovery:
+[data_loader] Dataset discovery:
     FOUND: /kaggle/input/datasets/chamberbot/forex-raw-data/forex_features.parquet
     missing: /kaggle/input/forex-raw-data/forex_features.parquet
 [data_loader] Loading from: /kaggle/input/datasets/chamberbot/forex-raw-data/forex_features.parquet
@@ -55,7 +55,9 @@ If the dataset is mounted in an unexpected location, the loader **recursively sc
 
 ---
 
-## Step 3: Agent B — XGBoost Macro-Sentiment
+## Step 3: Agent B — XGBoost Macro-Sentiment (v2.3.2)
+
+**IMPORTANT**: This notebook uses a **stable, callback-free XGBoost API** compatible with all Kaggle XGBoost builds.
 
 1. New Notebook
 2. **Settings**: Accelerator = None (CPU), Internet = ON
@@ -63,6 +65,12 @@ If the dataset is mounted in an unexpected location, the loader **recursively sc
 4. Paste `kaggle/agents/xgb_macro_sentiment.py`
 5. Save & Run
 6. Expected output: `macro_sentiment_xgb.onnx`
+
+**What makes v2.3.2 stable:**
+- No `early_stopping_rounds` parameter
+- No `callbacks` parameter
+- Pure `model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)`
+- Fault-tolerant macro column handling (survives missing DXY/VIX/yields)
 
 ---
 
@@ -103,7 +111,7 @@ If the dataset is mounted in an unexpected location, the loader **recursively sc
 ## Troubleshooting
 
 **"Dataset not found" even with Add Data:**
-The v2.2 loader will scan `/kaggle/input/` recursively. Check the debug output — it lists every path checked and the actual contents of `/kaggle/input/`. If the dataset is mounted under a different name, copy that path and add it to the `POSSIBLE_PATHS` list in the notebook.
+The loader will scan `/kaggle/input/` recursively. Check the debug output — it lists every path checked and the actual contents of `/kaggle/input/`. If the dataset is mounted under a different name, copy that path and add it to the `POSSIBLE_PATHS` list in the notebook.
 
 **"Module not found" errors:**
 ```python
@@ -113,3 +121,6 @@ The v2.2 loader will scan `/kaggle/input/` recursively. Check the debug output �
 **GPU out of memory:** Reduce `BATCH_SIZE` or `SEQ_LEN` in LSTM agent.
 
 **ONNX export fails:** Ensure `opset_version=14` and model is on CPU before export.
+
+**XGBoost TypeError about early_stopping or callbacks:**
+You are using an old version of the notebook. Update to v2.3.2 which removes these parameters entirely.
