@@ -1,6 +1,6 @@
 {
   "project": "forex-signals-bot",
-  "version": "2.3.3",
+  "version": "2.3.4",
   "owner": "chamberbot",
   "notebooks": {
     "etl": {

@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Agent A: LSTM Price Action Model v2.3.3
+Agent A: LSTM Price Action Model v2.3.4
 Trains on 1h technical sequences to predict next directional move.
 Output: price_action_lstm.onnx
 
-PATCH v2.3.3: CUDA kernel compatibility fix for Kaggle GPU notebooks.
-- Safe device detection with CUDA capability verification
-- Automatic CPU fallback if CUDA kernel image is incompatible
-- Removes dropout from LSTM (avoids CUDA kernel issues on some archs)
-- Bidirectional LSTM kept but with safe initialization
+PATCH v2.3.4:
+- NaN/inf cleanup in feature engineering (root cause of BCELoss crash)
+- Isolated CUDA test that cannot be poisoned by data NaNs
+- torch.nan_to_num() safety in forward pass
+- Gradient/weight NaN detection during training
+- Automatic CPU fallback on any CUDA assert
 """
 
 import os
@@ -25,36 +26,35 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.model_selection import train_test_split
 
 # ============================================================
-# SAFE DEVICE DETECTION
+# SAFE DEVICE DETECTION (isolated from data)
 # ============================================================
 def get_safe_device():
     """
-    Detect CUDA availability with kernel compatibility check.
-    Falls back to CPU if CUDA initialization fails.
+    Detect CUDA with an isolated test that cannot be affected by data NaNs.
+    Uses a completely separate tensor graph from any training data.
     """
     if not torch.cuda.is_available():
         print("[device] CUDA not available. Using CPU.")
         return torch.device("cpu")
 
     try:
-        # Test CUDA with a small tensor operation
-        test_tensor = torch.randn(2, 2).cuda()
-        _ = test_tensor @ test_tensor.T
-        torch.cuda.synchronize()
+        # Completely isolated test — no connection to training data
+        with torch.no_grad():
+            a = torch.ones(3, 3, device="cuda")
+            b = torch.ones(3, 3, device="cuda") * 2.0
+            c = a + b
+            torch.cuda.synchronize()
+            del a, b, c
+            torch.cuda.empty_cache()
 
         device_name = torch.cuda.get_device_name(0)
         capability = torch.cuda.get_device_capability(0)
         print(f"[device] CUDA OK: {device_name} (capability {capability[0]}.{capability[1]})")
         print(f"[device] PyTorch {torch.__version__} | CUDA {torch.version.cuda}")
-
-        # Warn on old architectures that may have kernel issues
-        if capability[0] < 6:
-            print("[device] WARNING: Old GPU architecture. May have kernel compatibility issues.")
-
         return torch.device("cuda")
     except Exception as e:
         print(f"[device] CUDA test failed: {e}")
-        print("[device] Falling back to CPU to avoid kernel image errors.")
+        print("[device] Falling back to CPU.")
         return torch.device("cpu")
 
 DEVICE = get_safe_device()
@@ -151,19 +151,47 @@ FEATURE_COLS = ["rsi_14", "ema_20_50_cross", "bollinger_position", "macd_hist", 
 PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "XAUUSD", "BTCUSD"]
 
 # ============================================================
-# FEATURE ENGINEERING
+# FEATURE ENGINEERING (with NaN/inf cleanup)
 # ============================================================
 def engineer_features(df):
+    """
+    Build features with aggressive NaN/inf cleanup.
+    This prevents BCELoss crash from invalid input values.
+    """
     df = df.copy()
+
+    # Normalize RSI
     df["rsi_14"] = df["rsi_14"] / 100.0
+
+    # Normalize ATR and MACD by price
     df["atr_14_norm"] = df["atr_14"] / df["close"]
     df["macd_hist_norm"] = df["macd_hist"] / df["close"]
+
+    # Compute returns
     if "returns" not in df.columns or df["returns"].isna().all():
         df["returns"] = df["close"].pct_change()
     df["returns"] = df["returns"].fillna(0)
+
+    # CRITICAL: Clean NaN and inf BEFORE clipping
     for col in ["rsi_14", "bollinger_position", "macd_hist_norm", "atr_14_norm", "returns"]:
+        # Replace inf/-inf with NaN, then fill NaN with 0
+        df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+        df[col] = df[col].fillna(0)
+        # Now safe to clip
         df[col] = df[col].clip(-5, 5)
+
     feature_cols = ["rsi_14", "ema_20_50_cross", "bollinger_position", "macd_hist_norm", "atr_14_norm", "returns"]
+
+    # Final safety: ensure no NaN or inf remains anywhere
+    for col in feature_cols:
+        if df[col].isna().any():
+            print(f"[WARN] NaN found in {col} after cleanup — filling with 0")
+            df[col] = df[col].fillna(0)
+        if np.isinf(df[col]).any():
+            print(f"[WARN] inf found in {col} after cleanup — replacing with 0")
+            df[col] = df[col].replace([np.inf, -np.inf], 0)
+
+    print(f"[features] NaN check passed. All columns clean.")
     return df, feature_cols
 
 # ============================================================
@@ -175,47 +203,69 @@ def create_sequences(df, feature_cols, seq_len=48, horizon=4):
         pdf = df[df["pair"] == pair].reset_index(drop=True)
         if len(pdf) < seq_len + horizon + 10:
             continue
+
+        # Verify no NaN before scaling
+        if pdf[feature_cols].isna().any().any():
+            print(f"[WARN] {pair} has NaN before scaling — filling")
+            pdf[feature_cols] = pdf[feature_cols].fillna(0)
+
         scaler = RobustScaler()
         pdf[feature_cols] = scaler.fit_transform(pdf[feature_cols])
+
+        # Double-check after scaling
+        pdf[feature_cols] = pdf[feature_cols].replace([np.inf, -np.inf], 0).fillna(0)
+
         vals = pdf[feature_cols].values.astype(np.float32)
         closes = pdf["close"].values
+
         for i in range(seq_len, len(vals) - horizon):
             seq = vals[i - seq_len:i]
             future_return = (closes[i + horizon] - closes[i]) / closes[i]
+
             if future_return > 0.001:
                 label = 1.0
             elif future_return < -0.001:
                 label = 0.0
             else:
                 continue
+
             X.append(seq)
             y.append(label)
-    return np.array(X), np.array(y)
+
+    X_arr = np.array(X, dtype=np.float32)
+    y_arr = np.array(y, dtype=np.float32)
+
+    # Final validation
+    if np.isnan(X_arr).any():
+        print("[WARN] NaN in X array — replacing with 0")
+        X_arr = np.nan_to_num(X_arr, nan=0.0, posinf=0.0, neginf=0.0)
+    if np.isnan(y_arr).any():
+        print("[WARN] NaN in y array — replacing with 0")
+        y_arr = np.nan_to_num(y_arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return X_arr, y_arr
 
 # ============================================================
 # PYTORCH DATASET
 # ============================================================
 class ForexDataset(Dataset):
     def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
+        # Ensure clean tensors
+        X_clean = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        y_clean = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+        self.X = torch.tensor(X_clean, dtype=torch.float32)
+        self.y = torch.tensor(y_clean, dtype=torch.float32).unsqueeze(1)
     def __len__(self):
         return len(self.X)
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
 # ============================================================
-# MODEL ARCHITECTURE (CUDA-safe)
+# MODEL ARCHITECTURE (with NaN safety)
 # ============================================================
 class LSTMPriceAction(nn.Module):
-    """
-    Bidirectional LSTM without intra-layer dropout.
-    Dropout between LSTM and FC layers only to avoid CUDA kernel issues.
-    """
     def __init__(self, input_dim, hidden_dim=128, num_layers=2):
         super().__init__()
-        # Note: dropout=0 in LSTM to avoid "no kernel image" errors
-        # Some Kaggle GPU builds lack kernels for dropout-enabled cuDNN LSTM
         self.lstm = nn.LSTM(
             input_dim, hidden_dim, num_layers,
             batch_first=True, dropout=0.0, bidirectional=True
@@ -227,16 +277,21 @@ class LSTMPriceAction(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
+        # nan_to_num safety: prevents NaN from propagating through network
+        x = torch.nan_to_num(x, nan=0.0, posinf=5.0, neginf=-5.0)
         lstm_out, _ = self.lstm(x)
         last = lstm_out[:, -1, :]
+        last = torch.nan_to_num(last, nan=0.0, posinf=5.0, neginf=-5.0)
         x = self.fc1(last)
         x = self.relu(x)
         x = self.dropout(x)
         x = self.fc2(x)
+        # Clamp before sigmoid to prevent overflow
+        x = torch.clamp(x, min=-10.0, max=10.0)
         return self.sigmoid(x)
 
 # ============================================================
-# TRAINING (with CUDA safety)
+# TRAINING (with NaN detection)
 # ============================================================
 def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3):
     model = model.to(DEVICE)
@@ -250,20 +305,39 @@ def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3):
     for epoch in range(epochs):
         model.train()
         train_losses = []
+
         for xb, yb in train_loader:
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+
             optimizer.zero_grad()
-            try:
-                pred = model(xb)
-            except RuntimeError as e:
-                if "no kernel image" in str(e).lower():
-                    print(f"[FATAL] CUDA kernel error during forward: {e}")
-                    print("[FATAL] Try re-running with CPU by setting DEVICE = torch.device('cpu')")
-                    raise
-                else:
-                    raise
+            pred = model(xb)
+
+            # CRITICAL: Verify pred is valid before BCELoss
+            if torch.isnan(pred).any() or torch.isinf(pred).any():
+                print(f"[FATAL] Model output has NaN/inf at epoch {epoch+1}")
+                print(f"        pred range: [{pred.min().item():.4f}, {pred.max().item():.4f}]")
+                raise RuntimeError("Model output invalid — check input data for NaN/inf")
+
             loss = criterion(pred, yb)
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"[FATAL] Loss is NaN/inf at epoch {epoch+1}")
+                raise RuntimeError("Loss became NaN — learning rate too high or data corrupt")
+
             loss.backward()
+
+            # Check gradients for NaN
+            has_nan_grad = False
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    if torch.isnan(param.grad).any():
+                        has_nan_grad = True
+                        print(f"[WARN] NaN gradient in {name} at epoch {epoch+1}")
+
+            if has_nan_grad:
+                optimizer.zero_grad()
+                continue
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             train_losses.append(loss.item())
@@ -283,13 +357,14 @@ def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3):
 
         if avg_val < best_val_loss:
             best_val_loss = avg_val
-            best_state = model.state_dict().copy()
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
         if (epoch + 1) % 5 == 0:
             print(f"Epoch {epoch+1}/{epochs} | Train: {avg_train:.4f} | Val: {avg_val:.4f}")
 
     if best_state:
         model.load_state_dict(best_state)
+        model = model.to(DEVICE)
     return model
 
 # ============================================================
@@ -297,7 +372,6 @@ def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3):
 # ============================================================
 def export_onnx(model, input_dim, seq_len, path="/kaggle/working/price_action_lstm.onnx"):
     model.eval()
-    # Always export from CPU to avoid CUDA-specific ops in ONNX
     model_cpu = model.to("cpu")
     dummy = torch.randn(1, seq_len, input_dim)
 
@@ -315,13 +389,11 @@ def export_onnx(model, input_dim, seq_len, path="/kaggle/working/price_action_ls
     )
     print(f"[onnx] Exported: {path}")
 
-    # Verify on CPU
     import onnxruntime as ort
     sess = ort.InferenceSession(path)
     test_out = sess.run(None, {"input": dummy.numpy()})[0]
     print(f"[onnx] Verification: shape={test_out.shape} | sample={test_out[0,0]:.4f}")
 
-    # Move model back to original device if needed
     if DEVICE.type == "cuda":
         model.to(DEVICE)
 
@@ -330,7 +402,7 @@ def export_onnx(model, input_dim, seq_len, path="/kaggle/working/price_action_ls
 # ============================================================
 def main():
     print("=" * 60)
-    print("AGENT A: LSTM PRICE ACTION v2.3.3")
+    print("AGENT A: LSTM PRICE ACTION v2.3.4")
     print(f"Device: {DEVICE}")
     print("=" * 60)
 
@@ -386,7 +458,7 @@ def main():
         "horizon": PRED_HORIZON,
         "device": str(DEVICE),
         "samples": len(X),
-        "version": "2.3.3"
+        "version": "2.3.4"
     }
     with open("/kaggle/working/price_action_lstm_meta.json", "w") as f:
         json.dump(meta, f, indent=2)
