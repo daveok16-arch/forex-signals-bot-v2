@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-Agent B: XGBoost Macro-Sentiment Model v2.3
+Agent B: XGBoost Macro-Sentiment Model v2.3.1
 Trains on daily macro features + pair aggregated stats.
 Output: macro_sentiment_xgb.onnx
 
 PATCH v2.3: Full fault tolerance for missing macro columns.
-- Dynamically builds agg_dict from existing columns only
-- Gracefully handles missing DXY, VIX, or yield spreads
-- Model trains with whatever macro data is available
-- Compatible with v2.2 unified data_loader
+PATCH v2.3.1: XGBoost API compatibility (early_stopping via callbacks for 2.x+)
 """
 
 import subprocess, sys
@@ -27,7 +24,13 @@ from onnxmltools.convert import convert_xgboost
 from skl2onnx.common.data_types import FloatTensorType
 
 # ============================================================
-# INLINED DATA LOADER v2.2 (unchanged from v2.2)
+# XGBOOST VERSION DETECTION
+# ============================================================
+XGB_MAJOR = int(xgb.__version__.split(".")[0])
+print(f"[xgb_compat] Detected XGBoost version: {xgb.__version__} (major={XGB_MAJOR})")
+
+# ============================================================
+# INLINED DATA LOADER v2.2
 # ============================================================
 POSSIBLE_PATHS = [
     "/kaggle/input/datasets/chamberbot/forex-raw-data/forex_features.parquet",
@@ -123,17 +126,14 @@ def engineer_macro_features(df):
     df["datetime"] = pd.to_datetime(df["datetime"])
     df["date"] = df["datetime"].dt.date
 
-    # Define which columns we WANT for aggregation
     desired_agg = {
         "close": ["first", "last", "min", "max"],
         "atr_14": "mean",
         "rsi_14": "mean",
     }
 
-    # Define which macro columns we WANT (may or may not exist)
     desired_macro = ["dxy_index", "vix_proxy", "yield_spread_us_de"]
 
-    # Build actual agg dict: only include columns that exist in the dataframe
     actual_agg = {}
     for col, agg_func in desired_agg.items():
         if col in df.columns:
@@ -152,15 +152,11 @@ def engineer_macro_features(df):
         pdf = df[df["pair"] == pair].copy()
         pdf = pdf.sort_values("datetime")
 
-        # Aggregate only existing columns
         day = pdf.groupby("date").agg(actual_agg).reset_index()
 
-        # Flatten multi-index columns if any
         if isinstance(day.columns, pd.MultiIndex):
             day.columns = ["_".join(col).strip("_") if isinstance(col, tuple) else col for col in day.columns.values]
 
-        # Standardize column names after aggregation
-        # close_first -> open, close_last -> close, close_min -> low, close_max -> high
         rename_map = {}
         for c in day.columns:
             if c == "close_first" or c == "close_first_":
@@ -187,7 +183,6 @@ def engineer_macro_features(df):
 
         day["pair"] = pair
 
-        # Compute derived features only if base columns exist
         if "open" in day.columns and "close" in day.columns:
             day["daily_return"] = (day["close"] - day["open"]) / day["open"]
         else:
@@ -198,20 +193,17 @@ def engineer_macro_features(df):
         else:
             day["daily_range"] = 0.0
 
-        # Forward-fill macro columns that exist
         macro_cols = ["dxy", "vix", "yield_spread"]
         for col in macro_cols:
             if col in day.columns:
                 day[col] = day[col].ffill().bfill()
 
-        # Lag features: only for macro columns that exist
         lag_candidates = ["dxy", "vix", "yield_spread", "avg_rsi"]
         for col in lag_candidates:
             if col in day.columns:
                 day[f"{col}_chg_1d"] = day[col].diff(1)
                 day[f"{col}_chg_3d"] = day[col].diff(3)
 
-        # Target: next day direction
         if "daily_return" in day.columns:
             day["target"] = (day["daily_return"].shift(-1) > 0.001).astype(float)
         else:
@@ -224,21 +216,52 @@ def engineer_macro_features(df):
     return daily
 
 # ============================================================
-# TRAINING
+# TRAINING v2.3.1 (XGBOOST API COMPATIBLE)
 # ============================================================
 def train_xgb(X_train, y_train, X_val, y_val):
+    """
+    Train XGBoost with version-safe early stopping.
+    Compatible with XGBoost 1.x and 2.x+ APIs.
+    """
     model = xgb.XGBRegressor(
-        n_estimators=300, max_depth=6, learning_rate=0.05,
-        subsample=0.8, colsample_bytree=0.8,
-        reg_alpha=0.1, reg_lambda=1.0,
-        random_state=42, n_jobs=-1,
-        objective="reg:squarederror", eval_metric="rmse"
+        n_estimators=300,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
+        random_state=42,
+        n_jobs=-1,
+        objective="reg:squarederror",
+        eval_metric="rmse"
     )
-    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=20, verbose=False)
+
+    # Version-safe early stopping
+    if XGB_MAJOR >= 2:
+        # XGBoost 2.x+: early_stopping_rounds moved to callbacks
+        print("[xgb_compat] Using XGBoost 2.x callback API for early stopping")
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            callbacks=[xgb.callback.EarlyStopping(rounds=20, save_best=True)],
+            verbose=False
+        )
+    else:
+        # XGBoost 1.x: legacy API
+        print("[xgb_compat] Using XGBoost 1.x legacy API for early stopping")
+        model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            early_stopping_rounds=20,
+            verbose=False
+        )
+
     val_pred = model.predict(X_val)
     val_acc = accuracy_score((y_val > 0.5).astype(int), (val_pred > 0.5).astype(int))
     val_auc = roc_auc_score(y_val, val_pred)
     print(f"Val Accuracy: {val_acc:.2%} | AUC: {val_auc:.4f}")
+
     return model
 
 # ============================================================
@@ -261,7 +284,8 @@ def export_onnx(model, feature_names, path="/kaggle/working/macro_sentiment_xgb.
 # ============================================================
 def main():
     print("=" * 60)
-    print("AGENT B: XGBOOST MACRO-SENTIMENT v2.3")
+    print("AGENT B: XGBOOST MACRO-SENTIMENT v2.3.1")
+    print(f"XGBoost: {xgb.__version__}")
     print("=" * 60)
 
     print("[1/4] Loading ETL data...")
@@ -274,7 +298,6 @@ def main():
     daily = engineer_macro_features(df)
     print(f"Daily samples: {len(daily)}")
 
-    # Dynamically select feature columns (exclude non-feature columns)
     exclude = {"date", "pair", "target", "open", "close", "low", "high", "daily_return", "daily_range"}
     feature_cols = [c for c in daily.columns if c not in exclude]
     print(f"Dynamic features: {feature_cols}")
@@ -301,7 +324,8 @@ def main():
         "feature_cols": feature_cols,
         "samples": len(X),
         "pos_rate": float(y.mean()),
-        "version": "2.3"
+        "version": "2.3.1",
+        "xgboost_version": xgb.__version__
     }
     with open("/kaggle/working/macro_sentiment_xgb_meta.json", "w") as f:
         json.dump(meta, f, indent=2)
