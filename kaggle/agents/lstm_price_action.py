@@ -1,16 +1,7 @@
 #!/usr/bin/env python3
-"""
-Agent A: LSTM Price Action Model v2.3.4
-Trains on 1h technical sequences to predict next directional move.
-Output: price_action_lstm.onnx
-
-PATCH v2.3.4:
-- NaN/inf cleanup in feature engineering (root cause of BCELoss crash)
-- Isolated CUDA test that cannot be poisoned by data NaNs
-- torch.nan_to_num() safety in forward pass
-- Gradient/weight NaN detection during training
-- Automatic CPU fallback on any CUDA assert
-"""
+# Agent A: LSTM Price Action Model v2.3.5
+# Output: price_action_lstm.onnx
+# Fixes: NaN/inf cleanup, CUDA isolation, no docstring corruption
 
 import os
 import json
@@ -26,19 +17,13 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.model_selection import train_test_split
 
 # ============================================================
-# SAFE DEVICE DETECTION (isolated from data)
+# SAFE DEVICE DETECTION
 # ============================================================
 def get_safe_device():
-    """
-    Detect CUDA with an isolated test that cannot be affected by data NaNs.
-    Uses a completely separate tensor graph from any training data.
-    """
     if not torch.cuda.is_available():
         print("[device] CUDA not available. Using CPU.")
         return torch.device("cpu")
-
     try:
-        # Completely isolated test — no connection to training data
         with torch.no_grad():
             a = torch.ones(3, 3, device="cuda")
             b = torch.ones(3, 3, device="cuda") * 2.0
@@ -46,7 +31,6 @@ def get_safe_device():
             torch.cuda.synchronize()
             del a, b, c
             torch.cuda.empty_cache()
-
         device_name = torch.cuda.get_device_name(0)
         capability = torch.cuda.get_device_capability(0)
         print(f"[device] CUDA OK: {device_name} (capability {capability[0]}.{capability[1]})")
@@ -60,7 +44,7 @@ def get_safe_device():
 DEVICE = get_safe_device()
 
 # ============================================================
-# INLINED DATA LOADER v2.2
+# DATA LOADER
 # ============================================================
 POSSIBLE_PATHS = [
     "/kaggle/input/datasets/chamberbot/forex-raw-data/forex_features.parquet",
@@ -151,38 +135,21 @@ FEATURE_COLS = ["rsi_14", "ema_20_50_cross", "bollinger_position", "macd_hist", 
 PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "XAUUSD", "BTCUSD"]
 
 # ============================================================
-# FEATURE ENGINEERING (with NaN/inf cleanup)
+# FEATURE ENGINEERING (NaN/inf cleanup)
 # ============================================================
 def engineer_features(df):
-    """
-    Build features with aggressive NaN/inf cleanup.
-    This prevents BCELoss crash from invalid input values.
-    """
     df = df.copy()
-
-    # Normalize RSI
     df["rsi_14"] = df["rsi_14"] / 100.0
-
-    # Normalize ATR and MACD by price
     df["atr_14_norm"] = df["atr_14"] / df["close"]
     df["macd_hist_norm"] = df["macd_hist"] / df["close"]
-
-    # Compute returns
     if "returns" not in df.columns or df["returns"].isna().all():
         df["returns"] = df["close"].pct_change()
     df["returns"] = df["returns"].fillna(0)
-
-    # CRITICAL: Clean NaN and inf BEFORE clipping
     for col in ["rsi_14", "bollinger_position", "macd_hist_norm", "atr_14_norm", "returns"]:
-        # Replace inf/-inf with NaN, then fill NaN with 0
         df[col] = df[col].replace([np.inf, -np.inf], np.nan)
         df[col] = df[col].fillna(0)
-        # Now safe to clip
         df[col] = df[col].clip(-5, 5)
-
     feature_cols = ["rsi_14", "ema_20_50_cross", "bollinger_position", "macd_hist_norm", "atr_14_norm", "returns"]
-
-    # Final safety: ensure no NaN or inf remains anywhere
     for col in feature_cols:
         if df[col].isna().any():
             print(f"[WARN] NaN found in {col} after cleanup — filling with 0")
@@ -190,8 +157,7 @@ def engineer_features(df):
         if np.isinf(df[col]).any():
             print(f"[WARN] inf found in {col} after cleanup — replacing with 0")
             df[col] = df[col].replace([np.inf, -np.inf], 0)
-
-    print(f"[features] NaN check passed. All columns clean.")
+    print("[features] NaN check passed. All columns clean.")
     return df, feature_cols
 
 # ============================================================
@@ -203,46 +169,33 @@ def create_sequences(df, feature_cols, seq_len=48, horizon=4):
         pdf = df[df["pair"] == pair].reset_index(drop=True)
         if len(pdf) < seq_len + horizon + 10:
             continue
-
-        # Verify no NaN before scaling
         if pdf[feature_cols].isna().any().any():
             print(f"[WARN] {pair} has NaN before scaling — filling")
             pdf[feature_cols] = pdf[feature_cols].fillna(0)
-
         scaler = RobustScaler()
         pdf[feature_cols] = scaler.fit_transform(pdf[feature_cols])
-
-        # Double-check after scaling
         pdf[feature_cols] = pdf[feature_cols].replace([np.inf, -np.inf], 0).fillna(0)
-
         vals = pdf[feature_cols].values.astype(np.float32)
         closes = pdf["close"].values
-
         for i in range(seq_len, len(vals) - horizon):
             seq = vals[i - seq_len:i]
             future_return = (closes[i + horizon] - closes[i]) / closes[i]
-
             if future_return > 0.001:
                 label = 1.0
             elif future_return < -0.001:
                 label = 0.0
             else:
                 continue
-
             X.append(seq)
             y.append(label)
-
     X_arr = np.array(X, dtype=np.float32)
     y_arr = np.array(y, dtype=np.float32)
-
-    # Final validation
     if np.isnan(X_arr).any():
         print("[WARN] NaN in X array — replacing with 0")
         X_arr = np.nan_to_num(X_arr, nan=0.0, posinf=0.0, neginf=0.0)
     if np.isnan(y_arr).any():
         print("[WARN] NaN in y array — replacing with 0")
         y_arr = np.nan_to_num(y_arr, nan=0.0, posinf=0.0, neginf=0.0)
-
     return X_arr, y_arr
 
 # ============================================================
@@ -250,7 +203,6 @@ def create_sequences(df, feature_cols, seq_len=48, horizon=4):
 # ============================================================
 class ForexDataset(Dataset):
     def __init__(self, X, y):
-        # Ensure clean tensors
         X_clean = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
         y_clean = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
         self.X = torch.tensor(X_clean, dtype=torch.float32)
@@ -261,7 +213,7 @@ class ForexDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 # ============================================================
-# MODEL ARCHITECTURE (with NaN safety)
+# MODEL
 # ============================================================
 class LSTMPriceAction(nn.Module):
     def __init__(self, input_dim, hidden_dim=128, num_layers=2):
@@ -275,9 +227,7 @@ class LSTMPriceAction(nn.Module):
         self.dropout = nn.Dropout(0.3)
         self.fc2 = nn.Linear(64, 1)
         self.sigmoid = nn.Sigmoid()
-
     def forward(self, x):
-        # nan_to_num safety: prevents NaN from propagating through network
         x = torch.nan_to_num(x, nan=0.0, posinf=5.0, neginf=-5.0)
         lstm_out, _ = self.lstm(x)
         last = lstm_out[:, -1, :]
@@ -286,62 +236,45 @@ class LSTMPriceAction(nn.Module):
         x = self.relu(x)
         x = self.dropout(x)
         x = self.fc2(x)
-        # Clamp before sigmoid to prevent overflow
         x = torch.clamp(x, min=-10.0, max=10.0)
         return self.sigmoid(x)
 
 # ============================================================
-# TRAINING (with NaN detection)
+# TRAINING
 # ============================================================
 def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3):
     model = model.to(DEVICE)
     criterion = nn.BCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
-
     best_val_loss = float("inf")
     best_state = None
-
     for epoch in range(epochs):
         model.train()
         train_losses = []
-
         for xb, yb in train_loader:
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-
             optimizer.zero_grad()
             pred = model(xb)
-
-            # CRITICAL: Verify pred is valid before BCELoss
             if torch.isnan(pred).any() or torch.isinf(pred).any():
                 print(f"[FATAL] Model output has NaN/inf at epoch {epoch+1}")
-                print(f"        pred range: [{pred.min().item():.4f}, {pred.max().item():.4f}]")
-                raise RuntimeError("Model output invalid — check input data for NaN/inf")
-
+                raise RuntimeError("Model output invalid")
             loss = criterion(pred, yb)
-
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"[FATAL] Loss is NaN/inf at epoch {epoch+1}")
-                raise RuntimeError("Loss became NaN — learning rate too high or data corrupt")
-
+                raise RuntimeError("Loss became NaN")
             loss.backward()
-
-            # Check gradients for NaN
             has_nan_grad = False
             for name, param in model.named_parameters():
-                if param.grad is not None:
-                    if torch.isnan(param.grad).any():
-                        has_nan_grad = True
-                        print(f"[WARN] NaN gradient in {name} at epoch {epoch+1}")
-
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    has_nan_grad = True
+                    print(f"[WARN] NaN gradient in {name} at epoch {epoch+1}")
             if has_nan_grad:
                 optimizer.zero_grad()
                 continue
-
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             train_losses.append(loss.item())
-
         model.eval()
         val_losses = []
         with torch.no_grad():
@@ -350,50 +283,41 @@ def train_model(model, train_loader, val_loader, epochs=50, lr=1e-3):
                 pred = model(xb)
                 loss = criterion(pred, yb)
                 val_losses.append(loss.item())
-
         avg_train = np.mean(train_losses)
         avg_val = np.mean(val_losses)
         scheduler.step(avg_val)
-
         if avg_val < best_val_loss:
             best_val_loss = avg_val
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-
         if (epoch + 1) % 5 == 0:
             print(f"Epoch {epoch+1}/{epochs} | Train: {avg_train:.4f} | Val: {avg_val:.4f}")
-
     if best_state:
         model.load_state_dict(best_state)
         model = model.to(DEVICE)
     return model
 
 # ============================================================
-# ONNX EXPORT (CPU-safe)
+# ONNX EXPORT
 # ============================================================
 def export_onnx(model, input_dim, seq_len, path="/kaggle/working/price_action_lstm.onnx"):
     model.eval()
     model_cpu = model.to("cpu")
     dummy = torch.randn(1, seq_len, input_dim)
-
     torch.onnx.export(
-        model_cpu,
-        dummy,
-        path,
-        input_names=["input"],
-        output_names=["probability"],
-        dynamic_axes={
-            "input": {0: "batch_size"},
-            "probability": {0: "batch_size"}
-        },
-        opset_version=14
+        model_cpu, dummy, path,
+        input_names=["input"], output_names=["probability"],
+        dynamic_axes={"input": {0: "batch_size"}, "probability": {0: "batch_size"}},
+        opset_version=18
     )
     print(f"[onnx] Exported: {path}")
-
-    import onnxruntime as ort
-    sess = ort.InferenceSession(path)
-    test_out = sess.run(None, {"input": dummy.numpy()})[0]
-    print(f"[onnx] Verification: shape={test_out.shape} | sample={test_out[0,0]:.4f}")
-
+    # Optional verification — skip if onnxruntime not installed
+    try:
+        import onnxruntime as ort
+        sess = ort.InferenceSession(path)
+        test_out = sess.run(None, {"input": dummy.numpy()})[0]
+        print(f"[onnx] Verification: shape={test_out.shape} | sample={test_out[0,0]:.4f}")
+    except ImportError:
+        print("[onnx] onnxruntime not installed — skipping verification")
     if DEVICE.type == "cuda":
         model.to(DEVICE)
 
@@ -402,39 +326,30 @@ def export_onnx(model, input_dim, seq_len, path="/kaggle/working/price_action_ls
 # ============================================================
 def main():
     print("=" * 60)
-    print("AGENT A: LSTM PRICE ACTION v2.3.4")
+    print("AGENT A: LSTM PRICE ACTION v2.3.6")
     print(f"Device: {DEVICE}")
     print("=" * 60)
-
     print("[1/5] Loading ETL data...")
     df = load_forex_data()
     print(f"      Rows: {len(df)} | Pairs: {df['pair'].nunique()}")
-
     print("[2/5] Validating dataset...")
     validate_dataset(df)
-
     print("[3/5] Engineering features...")
     df, feature_cols = engineer_features(df)
     print(f"      Features: {feature_cols}")
-
     print("[4/5] Creating sequences...")
     X, y = create_sequences(df, feature_cols, SEQ_LEN, PRED_HORIZON)
     print(f"      Sequences: {len(X)} | Positives: {y.mean():.2%}")
-
     if len(X) < 1000:
-        raise RuntimeError("Insufficient training data. Check ETL dataset.")
-
+        raise RuntimeError("Insufficient training data.")
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-
     train_ds = ForexDataset(X_train, y_train)
     val_ds = ForexDataset(X_val, y_val)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE)
-
     print("[5/5] Training LSTM...")
     model = LSTMPriceAction(len(feature_cols))
     model = train_model(model, train_loader, val_loader, epochs=EPOCHS, lr=LR)
-
     model.eval()
     all_preds, all_true = [], []
     with torch.no_grad():
@@ -443,13 +358,10 @@ def main():
             pred = model(xb).cpu().numpy()
             all_preds.extend(pred.flatten())
             all_true.extend(yb.numpy().flatten())
-
     acc = np.mean((np.array(all_preds) > 0.5) == (np.array(all_true) > 0.5))
     print(f"      Validation Accuracy: {acc:.2%}")
-
     print("[onnx] Exporting ONNX...")
     export_onnx(model, len(feature_cols), SEQ_LEN)
-
     meta = {
         "agent": "price_action_lstm",
         "val_accuracy": float(acc),
@@ -458,11 +370,10 @@ def main():
         "horizon": PRED_HORIZON,
         "device": str(DEVICE),
         "samples": len(X),
-        "version": "2.3.4"
+        "version": "2.3.6"
     }
     with open("/kaggle/working/price_action_lstm_meta.json", "w") as f:
         json.dump(meta, f, indent=2)
-
     print("=" * 60)
     print("AGENT A COMPLETE")
     print("=" * 60)
