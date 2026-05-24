@@ -1,54 +1,63 @@
 #!/usr/bin/env python3
 
 import os
+import json
 import sys
-import requests
 from datetime import datetime, timezone
 
-DATASET_NAME = "chamberbot/forex-raw-data"
+META_PATH = "data/metadata.json"
 
-def check():
-    url = f"https://www.kaggle.com/api/v1/datasets/view/{DATASET_NAME}"
+def is_market_closed():
+    now = datetime.now(timezone.utc)
 
-    print(f"[DEBUG] Querying dataset: {DATASET_NAME}")
-    print(f"[DEBUG] URL: {url}")
+    wd = now.weekday()
+    hr = now.hour
 
-    resp = requests.get(
-        url,
-        auth=(os.environ["KAGGLE_USERNAME"], os.environ["KAGGLE_KEY"])
-    )
+    if wd == 4 and hr >= 21:
+        return True
 
-    print(f"[DEBUG] HTTP Status: {resp.status_code}")
+    if wd == 5:
+        return True
 
-    if resp.status_code != 200:
-        print(resp.text)
+    if wd == 6 and hr < 21:
+        return True
+
+    return False
+
+def main():
+    if not os.path.exists(META_PATH):
+        print(f"DATA STALE: {META_PATH} missing.")
         sys.exit(1)
 
-    data = resp.json()
+    with open(META_PATH) as f:
+        meta = json.load(f)
 
-    print(f"[DEBUG] API Response:")
-    print(data)
+    ts_str = meta.get("timestamp_utc", "")
 
-    last_updated = data["lastUpdated"]
+    if not ts_str:
+        print("DATA STALE: No timestamp_utc.")
+        sys.exit(1)
 
-    print(f"[DEBUG] lastUpdated = {last_updated}")
-
-    last_refreshed = datetime.strptime(
-        last_updated,
-        "%Y-%m-%dT%H:%M:%S.%fZ"
-    ).replace(tzinfo=timezone.utc)
+    last_run = datetime.fromisoformat(
+        ts_str.replace("Z", "+00:00")
+    )
 
     age_hours = (
-        datetime.now(timezone.utc) - last_refreshed
+        datetime.now(timezone.utc) - last_run
     ).total_seconds() / 3600
 
-    print(f"Dataset age: {age_hours:.1f} hours")
+    threshold = 72 if is_market_closed() else 24
 
-    if age_hours > 8:
+    print(f"Dataset age: {age_hours:.1f} hours")
+    print(f"Threshold: {threshold} hours")
+    print(f"Last ETL: {ts_str}")
+
+    if age_hours > threshold:
         print("DATA STALE: Triggering alert")
         sys.exit(1)
 
-    print("DATA FRESH: Proceeding")
+    print("DATA FRESH")
+    sys.exit(0)
 
 if __name__ == "__main__":
-    check()
+    main()

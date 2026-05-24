@@ -1,0 +1,86 @@
+name: Forex Bot Pipeline
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Kaggle CLI
+        run: pip install -q kaggle
+
+      - name: Pull live dataset from Kaggle
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          mkdir -p data
+          kaggle datasets download chamberbot/forex-raw-data -p data/ --unzip
+
+          echo "=== Downloaded files ==="
+          ls -la data/
+
+          echo "=== Metadata ==="
+          cat data/metadata.json || echo "No metadata.json"
+
+      - name: Check data freshness
+        run: python .github/scripts/check_freshness.py
+
+      - name: Verify models exist
+        run: |
+          mkdir -p models
+          ls -la models/ || echo "Models folder empty"
+
+      - name: Build release bundle
+        if: success()
+        run: |
+          VERSION=$(date +%Y%m%d-%H%M)
+
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+          mkdir -p release
+
+          cp data/forex_features.parquet release/ 2>/dev/null || true
+          cp data/metadata.json release/ 2>/dev/null || true
+          cp models/*.onnx release/ 2>/dev/null || true
+          cp -r .github/scripts release/ 2>/dev/null || true
+
+          cd release
+          zip -r ../forex-bot-bundle-${VERSION}.zip .
+
+      - name: Upload to GitHub Release
+        if: success()
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: Forex Bot Bundle ${{ env.VERSION }}
+          files: forex-bot-bundle-*.zip
+          body: |
+            Auto-generated bundle:
+            - Fresh forex data from Kaggle ETL
+            - ONNX agent models
+            - Inference scripts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Telegram alert on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "text=🚨 Forex Bot WORKFLOW FAILED%0A${{ github.run_id }}"
