@@ -7,7 +7,7 @@ import requests
 from datetime import datetime, timezone, timedelta
 
 KAGGLE_USER = os.environ["KAGGLE_USERNAME"]
-DATASET_NAME = f"{KAGGLE_USER}/forex-raw-data"
+DATASET_NAME = "chamberbot/forex-raw-data"
 
 def check():
     url = f"https://www.kaggle.com/api/v1/datasets/view/{DATASET_NAME}"
