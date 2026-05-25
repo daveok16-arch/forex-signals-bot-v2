@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import os
 import json
 import sys
@@ -9,16 +8,12 @@ META_PATH = "data/metadata.json"
 
 def is_market_closed():
     now = datetime.now(timezone.utc)
-
-    wd = now.weekday()
-    hr = now.hour
+    wd, hr = now.weekday(), now.hour
 
     if wd == 4 and hr >= 21:
         return True
-
     if wd == 5:
         return True
-
     if wd == 6 and hr < 21:
         return True
 
@@ -26,7 +21,7 @@ def is_market_closed():
 
 def main():
     if not os.path.exists(META_PATH):
-        print(f"DATA STALE: {META_PATH} missing.")
+        print("DATA STALE: metadata.json missing. Kaggle dataset download failed.")
         sys.exit(1)
 
     with open(META_PATH) as f:
@@ -35,12 +30,10 @@ def main():
     ts_str = meta.get("timestamp_utc", "")
 
     if not ts_str:
-        print("DATA STALE: No timestamp_utc.")
+        print("DATA STALE: No timestamp_utc in metadata.")
         sys.exit(1)
 
-    last_run = datetime.fromisoformat(
-        ts_str.replace("Z", "+00:00")
-    )
+    last_run = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
 
     age_hours = (
         datetime.now(timezone.utc) - last_run
@@ -48,16 +41,19 @@ def main():
 
     threshold = 72 if is_market_closed() else 24
 
-    print(f"Dataset age: {age_hours:.1f} hours")
-    print(f"Threshold: {threshold} hours")
+    print(f"Dataset age: {age_hours:.1f} hours (threshold: {threshold}h)")
     print(f"Last ETL: {ts_str}")
+    print(f"Rows: {meta.get('total_rows', 'N/A')}")
 
     if age_hours > threshold:
-        print("DATA STALE: Triggering alert")
+        print(
+            "DATA STALE: Kaggle ETL has not published fresh data. "
+            "Run the ETL notebook manually or check Kaggle scheduler."
+        )
         sys.exit(1)
-
-    print("DATA FRESH")
-    sys.exit(0)
+    else:
+        print("DATA FRESH")
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
